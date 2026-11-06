@@ -1,0 +1,105 @@
+name: AOSP17 custom-preference source and Settings boundary
+
+on:
+  push:
+    branches:
+      - audit/a17-custom-preference-boundary-20261107
+    paths:
+      - 'audit/check_preference_source.py'
+      - 'docs/ANDROID_17_CUSTOM_PREFERENCE_BOUNDARY_AUDIT.md'
+      - '.github/workflows/a17-custom-preference-source.yml'
+  pull_request:
+    paths:
+      - 'audit/check_preference_source.py'
+      - 'docs/ANDROID_17_CUSTOM_PREFERENCE_BOUNDARY_AUDIT.md'
+      - '.github/workflows/a17-custom-preference-source.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-settings-preference-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout historical PE preference sources and audit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Fetch exact historic PE seventeen tree
+        run: |
+          git fetch -q --no-tags --depth=1 origin \
+            +refs/heads/seventeen:refs/remotes/origin/seventeen
+      - name: Fetch pinned modern LineagePreferenceLib (READ-ONLY reference)
+        run: |
+          mkdir -p "$RUNNER_TEMP/lineage-sdk"
+          git -C "$RUNNER_TEMP/lineage-sdk" init -q
+          git -C "$RUNNER_TEMP/lineage-sdk" remote add origin \
+            https://github.com/LineageOS/android_lineage-sdk.git
+          git -C "$RUNNER_TEMP/lineage-sdk" fetch -q --no-tags \
+            --filter=blob:none --depth=1 origin \
+            854d7bfc24669e18e9a318e480d573703511237b
+      - name: Fetch immutable official AOSP17 Settings release source
+        run: |
+          mkdir -p "$RUNNER_TEMP/aosp17-settings"
+          git -C "$RUNNER_TEMP/aosp17-settings" init -q
+          git -C "$RUNNER_TEMP/aosp17-settings" remote add origin \
+            https://android.googlesource.com/platform/packages/apps/Settings
+          git -C "$RUNNER_TEMP/aosp17-settings" fetch -q --no-tags \
+            --filter=blob:none --depth=1 origin \
+            refs/tags/android-17.0.0_r1
+      - name: Fetch reviewed AOSP17 manifest
+        run: |
+          git clone -q --depth=1 \
+            --branch port/a17-aosp17-manifest-20261102 \
+            https://github.com/PixelExperience-Reborn/manifest.git \
+            "$RUNNER_TEMP/manifest"
+      - name: Verify historical preference risks, modern SDK reference, AOSP17 Settings
+        run: |
+          python3 audit/check_preference_source.py \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/lineage-sdk" \
+            "$RUNNER_TEMP/aosp17-settings" \
+            "$RUNNER_TEMP/manifest"
+      - name: Run full staged manifest positive and negative regression tests
+        run: |
+          cd "$RUNNER_TEMP/manifest"
+          python3 -m unittest discover -s tools \
+            -p 'test_aosp17_manifest_entrypoint.py' -v
+      - name: Resolve actual AOSP17 manifest using the official repo client
+        run: |
+          curl --fail --silent --show-error --location \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$RUNNER_TEMP/repo"
+          chmod +x "$RUNNER_TEMP/repo"
+          mkdir -p "$RUNNER_TEMP/repo-graph"
+          cd "$RUNNER_TEMP/repo-graph"
+          "$RUNNER_TEMP/repo" init -q --no-clone-bundle \
+            -u https://github.com/PixelExperience-Reborn/manifest \
+            -b port/a17-aosp17-manifest-20261102 -m default.xml
+          "$RUNNER_TEMP/repo" manifest -o "$RUNNER_TEMP/resolved.xml"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import xml.etree.ElementTree as ET
+
+          root=ET.parse(Path(os.environ["RUNNER_TEMP"])/"resolved.xml").getroot()
+          projects=root.findall(".//project")
+          owners={p.get("path") or p.get("name"):p.get("name") for p in projects}
+          assert len(projects)==len(owners)==1069, (
+              "expected 1069 unique reviewed source paths", len(projects),len(owners))
+          assert owners.get("packages/apps/Settings")=="platform/packages/apps/Settings", (
+              "official Android17 Settings owner changed")
+          assert "vendor/custom-preference" not in owners, "legacy preference source enabled"
+          assert "vendor_custom-preference" not in owners.values()
+          assert "lineage-sdk" not in owners
+          print("PASS: official repo manifest retains 1069 distinct AOSP17 projects")
+          print("PASS: no legacy custom-preference or Lineage SDK active source")
+          print("PASS: official Android17 Settings owner preserved")
+          PY
+      - name: State precise test limitations
+        run: |
+          echo "SOURCE-ONLY: old PE Git files, modern Lineage ref, official Settings Soong and manifest."
+          echo "NOT TESTED: Settings app compilation, pref UI, privilege security, exported receiver,"
+          echo "multi-user/work profile behavior, overlays, CTS/VTS, PE mondrian build or device boot."
